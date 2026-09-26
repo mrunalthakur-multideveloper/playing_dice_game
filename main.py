@@ -31,6 +31,10 @@ LOCATIONS = ["San Francisco, CA"]
 _env_max = os.getenv("MAX_JOBS_PER_KEYWORD", os.getenv("MAX_JOBS", "100")).strip()
 MAX_JOBS_PER_KEYWORD = int(_env_max) if _env_max.isdigit() and int(_env_max) > 0 else (None if _env_max.lower() in ["none", "0", "unlimited"] else 100)
 MAX_JOBS = MAX_JOBS_PER_KEYWORD
+
+# Max search keywords to scrape: configurable via MAX_KEYWORDS env var (e.g. 5, or None for all)
+_env_keywords = os.getenv("MAX_KEYWORDS", "").strip()
+MAX_KEYWORDS = int(_env_keywords) if _env_keywords.isdigit() and int(_env_keywords) > 0 else None
 OUTPUT_FILE = f"dice_jobs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
 
 # 1. SOURCE API: Fetch active client desired job titles from ApplyUS CRM API
@@ -769,7 +773,11 @@ async def main():
     logger.info("Starting Dice Route Scraper (HTTP Route Access)...")
     
     search_terms = await fetch_desired_job_titles_from_active_clients()
-    logger.info(f"Target scraping keywords / job titles ({len(search_terms)}): {search_terms}")
+    if MAX_KEYWORDS and len(search_terms) > MAX_KEYWORDS:
+        search_terms = search_terms[:MAX_KEYWORDS]
+        logger.info(f"Limited search keywords to first {MAX_KEYWORDS}: {search_terms}")
+    else:
+        logger.info(f"Target scraping keywords / job titles ({len(search_terms)}): {search_terms}")
     
     all_results = []
     limits = httpx.Limits(max_keepalive_connections=20, max_connections=30)
