@@ -27,9 +27,10 @@ logger = logging.getLogger(__name__)
 # Constants & Configuration
 SEARCH_TERMS = ["software engineer"]
 LOCATIONS = ["San Francisco, CA"]
-# Scrape limit: defaults to 20 for testing (configurable via MAX_JOBS env var)
-_env_max = os.getenv("MAX_JOBS", "20").strip()
-MAX_JOBS = int(_env_max) if _env_max.isdigit() and int(_env_max) > 0 else (None if _env_max.lower() in ["none", "0", "unlimited"] else 20)
+# Scrape limit per keyword: defaults to 100 (configurable via MAX_JOBS_PER_KEYWORD or MAX_JOBS env var)
+_env_max = os.getenv("MAX_JOBS_PER_KEYWORD", os.getenv("MAX_JOBS", "100")).strip()
+MAX_JOBS_PER_KEYWORD = int(_env_max) if _env_max.isdigit() and int(_env_max) > 0 else (None if _env_max.lower() in ["none", "0", "unlimited"] else 100)
+MAX_JOBS = MAX_JOBS_PER_KEYWORD
 OUTPUT_FILE = f"dice_jobs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
 
 # 1. SOURCE API: Fetch active client desired job titles from ApplyUS CRM API
@@ -782,16 +783,15 @@ async def main():
 
     try:
         for term in search_terms:
-            if MAX_JOBS and len(all_results) >= MAX_JOBS:
-                break
-            logger.info(f"=== Starting scrape for domain/function: '{term}' ===")
+            logger.info(f"=== Starting scrape for keyword: '{term}' (Target: up to {MAX_JOBS_PER_KEYWORD or 'unlimited'} jobs) ===")
+            term_count = 0
             for loc in LOCATIONS:
-                if MAX_JOBS and len(all_results) >= MAX_JOBS:
+                if MAX_JOBS_PER_KEYWORD and term_count >= MAX_JOBS_PER_KEYWORD:
                     break
                 page_num = 1
                 
                 while True:
-                    if MAX_JOBS and len(all_results) >= MAX_JOBS:
+                    if MAX_JOBS_PER_KEYWORD and term_count >= MAX_JOBS_PER_KEYWORD:
                         break
 
                     search_url = f"https://www.dice.com/jobs?q={urllib.parse.quote_plus(term)}&location={urllib.parse.quote_plus(loc)}&page={page_num}"
@@ -801,7 +801,7 @@ async def main():
                     max_search_attempts = min(3, proxy_rotator.total()) if proxy_rotator.has_proxies() else 1
                     for attempt in range(max_search_attempts):
                         client, proxy_label = await proxy_rotator.get_client()
-                        logger.info(f"Accessing Search Route (Page {page_num}) via {proxy_label}: {search_url}")
+                        logger.info(f"Accessing Search Route for '{term}' (Page {page_num}) via {proxy_label}: {search_url}")
                         try:
                             r = await client.get(search_url)
                             if r.status_code == 200:
@@ -835,13 +835,13 @@ async def main():
                                 job_links.append(href)
                                 
                     if not job_links:
-                        logger.info(f"No more job links found on page {page_num}. Finished search for {term} in {loc}.")
+                        logger.info(f"No more job links found on page {page_num}. Finished search for '{term}' in {loc}.")
                         break
                     
-                    logger.info(f"Found {len(job_links)} jobs on page {page_num}. Processing...")
+                    logger.info(f"Found {len(job_links)} jobs on page {page_num} for '{term}'. Processing...")
                     
                     for link in job_links:
-                        if MAX_JOBS and len(all_results) >= MAX_JOBS:
+                        if MAX_JOBS_PER_KEYWORD and term_count >= MAX_JOBS_PER_KEYWORD:
                             break
                         
                         # Fetch job detail with proxy rotation and retry
@@ -868,20 +868,21 @@ async def main():
 
                         if job_data:
                             all_results.append(job_data)
+                            term_count += 1
                             
                             # Phase 1: Store incrementally in CSV file only
                             df = pd.DataFrame(all_results)
                             df.to_csv(OUTPUT_FILE, index=False)
-                            logger.info(f"Saved {len(all_results)} / {MAX_JOBS or 'all'} jobs to CSV: {OUTPUT_FILE}")
+                            logger.info(f"[{term}] Saved {term_count} / {MAX_JOBS_PER_KEYWORD or 'all'} jobs (Total scraped across all keywords: {len(all_results)}) to CSV: {OUTPUT_FILE}")
 
-                            if MAX_JOBS and len(all_results) >= MAX_JOBS:
-                                logger.info(f"Reached requested test limit of {MAX_JOBS} jobs. Ending scrape phase.")
+                            if MAX_JOBS_PER_KEYWORD and term_count >= MAX_JOBS_PER_KEYWORD:
+                                logger.info(f"Reached target limit of {MAX_JOBS_PER_KEYWORD} jobs for keyword '{term}'. Moving to next keyword.")
                                 break
                             
                         # Wait 3 seconds before next request
                         await asyncio.sleep(3)
                         
-                    if MAX_JOBS and len(all_results) >= MAX_JOBS:
+                    if MAX_JOBS_PER_KEYWORD and term_count >= MAX_JOBS_PER_KEYWORD:
                         break
 
                     page_num += 1
