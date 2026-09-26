@@ -1,0 +1,53 @@
+{
+    "title": "Dice Scraper Input",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "searchTerms": {
+            "title": "Search Terms",
+            "type": "array",
+            "description": "List of job titles or keywords to search for.",
+            "editor": "stringList",
+            "default": [
+                "software engineer"
+            ]
+        },
+        "locations": {
+            "title": "Locations",
+            "type": "array",
+            "description": "List of locations to search in.",
+            "editor": "stringList",
+            "default": [
+                "San Francisco, CA"
+            ]
+        },
+        "maxJobs": {
+            "title": "Max Jobs",
+            "type": "integer",
+            "description": "Maximum number of jobs to scrape.",
+            "default": 20
+        },
+        "proxyConfiguration": {
+            "title": "Proxy Configuration",
+            "type": "object",
+            "description": "Select proxies to be used by your Crawler.",
+            "editor": "proxy",
+            "default": {
+                "useApifyProxy": true,
+                "apifyProxyGroups": [
+                    "RESIDENTIAL"
+                ]
+            }
+        },
+        "debug": {
+            "title": "Debug Mode",
+            "type": "boolean",
+            "description": "Enable debug logging.",
+            "default": false
+        }
+    },
+    "required": [
+        "searchTerms",
+        "locations"
+    ]
+}

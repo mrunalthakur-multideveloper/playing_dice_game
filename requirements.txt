@@ -1,0 +1,8 @@
+apify
+playwright
+pandas
+beautifulsoup4
+asyncio
+httpx
+python-dotenv
+psycopg2-binary>=2.9.0
