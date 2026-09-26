@@ -46,6 +46,10 @@ MAX_JOBS = MAX_JOBS_PER_KEYWORD
 # Max search keywords to scrape: configurable via MAX_KEYWORDS env var (e.g. 5, or None for all)
 _env_keywords = os.getenv("MAX_KEYWORDS", "").strip()
 MAX_KEYWORDS = int(_env_keywords) if _env_keywords.isdigit() and int(_env_keywords) > 0 else None
+
+# Filter for jobs posted or updated within the last 24 hours only (defaults to True)
+_env_24h = os.getenv("ONLY_LAST_24_HOURS", "true").strip().lower()
+ONLY_LAST_24_HOURS = _env_24h not in ["false", "0", "no"]
 OUTPUT_FILE = f"dice_jobs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
 
 # 1. SOURCE API: Fetch active client desired job titles from ApplyUS CRM API
@@ -374,6 +378,68 @@ def clean_description(raw_html):
     cleaned = '\n'.join(lines)
     return re.sub(r'\n{3,}', '\n\n', cleaned).strip()
 
+def is_within_24_hours(posted_text, updated_text, json_ld_posted_iso=None):
+    """
+    Returns (True, reason) if either:
+    1. The job was posted within the last 24 hours.
+    2. The job was posted earlier but updated within the last 24 hours.
+    Returns (False, reason) if both posted and updated are older than 24 hours.
+    """
+    def check_relative(text):
+        if not text:
+            return None
+        t = text.lower().strip()
+        # Definite recent markers (< 24 hours)
+        if any(w in t for w in ['just now', 'today', 'moments ago', 'minute', 'min', 'second', 'sec']):
+            return True
+        # Hour markers (e.g. "5 hours ago", "22 hours ago")
+        if 'hour' in t or 'hr' in t:
+            m = re.search(r'(\d+)\s*(?:hour|hr)', t)
+            if m:
+                return int(m.group(1)) <= 24
+            return True
+        # Explicit days / weeks / months / years ago (> 24 hours)
+        if any(w in t for w in ['day', 'week', 'month', 'year']):
+            return False
+        return None
+
+    # 1. If updated text indicates within 24 hours, immediately accept!
+    u_fresh = check_relative(updated_text)
+    if u_fresh is True:
+        return True, f"Updated within last 24h: '{updated_text}'"
+
+    # 2. If posted text indicates within 24 hours, accept!
+    p_fresh = check_relative(posted_text)
+    if p_fresh is True:
+        return True, f"Posted within last 24h: '{posted_text}'"
+
+    # 3. Check exact ISO timestamp from JSON-LD if available
+    if json_ld_posted_iso:
+        try:
+            iso_clean = json_ld_posted_iso.replace('Z', '+00:00')
+            dt = datetime.fromisoformat(iso_clean)
+            now = datetime.now(timezone.utc)
+            delta = now - dt
+            if delta.total_seconds() <= 86400: # 24 hours
+                return True, f"Posted {delta.total_seconds()/3600:.1f}h ago (ISO timestamp)"
+            else:
+                # If posted is > 24 hours ago, and updated text is NOT fresh:
+                if u_fresh is not True:
+                    return False, f"Posted {delta.days} day(s) ago and not updated in last 24h"
+        except Exception:
+            pass
+
+    # 4. If updated text is definitely > 24 hours (e.g. "5 days ago", "2 days ago"):
+    if u_fresh is False:
+        return False, f"Both posted and updated > 24h ago (Updated: '{updated_text}')"
+
+    # 5. If posted text is definitely > 24 hours and no fresh update was found:
+    if p_fresh is False:
+        return False, f"Posted > 24h ago ('{posted_text}') and no update within 24h"
+
+    # If completely indeterminate, allow by default
+    return True, "Indeterminate date, allowed by default"
+
 async def fetch_job_detail(client, job_url, search_keyword):
     """Fetch and parse all job fields directly from job-detail route."""
     try:
@@ -462,6 +528,27 @@ async def fetch_job_detail(client, job_url, search_keyword):
         date_posted_raw = json_ld.get('datePosted')
         date_posted = date_posted_raw[:10] if date_posted_raw else datetime.now(timezone.utc).strftime('%Y-%m-%d')
         now_iso = datetime.now(timezone.utc).isoformat()
+        
+        # Extract relative posted and updated text for 24-hour freshness verification
+        posted_str = None
+        updated_str = None
+        for span in soup.find_all('span'):
+            t = span.get_text(strip=True)
+            if 'posted' in t.lower() and ('ago' in t.lower() or 'today' in t.lower() or 'yesterday' in t.lower()):
+                m = re.search(r'posted\s*([^•·|,\n]+)', t, re.I)
+                if m:
+                    posted_str = m.group(1).strip()
+            if 'updated' in t.lower() and ('ago' in t.lower() or 'today' in t.lower() or 'yesterday' in t.lower()):
+                m = re.search(r'updated\s*([^•·|,\n]+)', t, re.I)
+                if m:
+                    updated_str = m.group(1).strip()
+
+        # Strict 24-Hour Freshness Filter
+        if ONLY_LAST_24_HOURS:
+            is_fresh, freshness_reason = is_within_24_hours(posted_str, updated_str, date_posted_raw)
+            if not is_fresh:
+                logger.info(f"⏭️ Skipping stale job [{job_id}] '{title}': {freshness_reason} (Posted: '{posted_str or date_posted}', Updated: '{updated_str or 'None'}')")
+                return None
         
         # Job Type & Level
         job_type = json_ld.get('employmentType', 'FULL_TIME')
@@ -813,7 +900,8 @@ async def main():
                     if MAX_JOBS_PER_KEYWORD and term_count >= MAX_JOBS_PER_KEYWORD:
                         break
 
-                    search_url = f"https://www.dice.com/jobs?q={urllib.parse.quote_plus(term)}&location={urllib.parse.quote_plus(loc)}&page={page_num}"
+                    date_filter = "&filters.postedDate=ONE" if ONLY_LAST_24_HOURS else ""
+                    search_url = f"https://www.dice.com/jobs?q={urllib.parse.quote_plus(term)}&location={urllib.parse.quote_plus(loc)}{date_filter}&page={page_num}"
                     
                     # Fetch search route with proxy rotation & retry
                     res = None
