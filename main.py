@@ -4,6 +4,7 @@ import re
 import json
 import logging
 import urllib.parse
+import sys
 from datetime import datetime, timezone
 import pandas as pd
 import httpx
@@ -17,12 +18,22 @@ try:
 except ImportError:
     HAS_PSYCOPG2 = False
 
-# Load environment variables from .env
+# Load environment variables from .env (checks script directory and current working directory)
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_env_path = os.path.join(_script_dir, ".env")
+if os.path.exists(_env_path):
+    load_dotenv(dotenv_path=_env_path)
 load_dotenv()
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Configure logging with real-time unbuffered flushing (essential for Google Colab)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)],
+    force=True
+)
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 # Constants & Configuration
 SEARCH_TERMS = ["software engineer"]
@@ -912,4 +923,16 @@ async def main():
         logger.warning("No jobs were extracted.")
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except RuntimeError as e:
+        if "running event loop" in str(e).lower() or "event loop is already running" in str(e).lower():
+            try:
+                import nest_asyncio
+                nest_asyncio.apply()
+            except ImportError:
+                pass
+            loop = asyncio.get_event_loop()
+            loop.run_until_complete(main())
+        else:
+            raise
