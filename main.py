@@ -440,7 +440,7 @@ def is_within_24_hours(posted_text, updated_text, json_ld_posted_iso=None):
     # If completely indeterminate, allow by default
     return True, "Indeterminate date, allowed by default"
 
-async def fetch_job_detail(client, job_url, search_keyword):
+async def fetch_job_detail(client, job_url, search_keyword, search_country=None):
     """Fetch and parse all job fields directly from job-detail route."""
     try:
         res = await client.get(job_url)
@@ -514,6 +514,9 @@ async def fetch_job_detail(client, job_url, search_keyword):
                 raw_loc = urllib.parse.unquote_plus(m.group(1))
                 
         loc_city, loc_state, loc_country, location_display = parse_location_details(raw_loc)
+        if search_country and (not loc_country or loc_country in ["USA", "United States"]):
+            if search_country.lower() not in ["usa", "united states", "us"]:
+                loc_country = search_country
         
         # Apply URL
         apply_url = job_url
@@ -617,14 +620,25 @@ async def fetch_job_detail(client, job_url, search_keyword):
         return None
 
 async def fetch_desired_job_titles_from_active_clients():
-    """Fetch desired_job_titles from active clients via ApplyUS CRM API as search keywords."""
+    """
+    Fetch target job titles paired with country from the active clients / lightweight endpoint.
+    Deduplicates by (country, keyword) so multiple clients from the same country and same
+    domain/title are only scraped ONCE.
+    """
     default_terms = SEARCH_TERMS
+    default_country = LOCATIONS[0] if LOCATIONS else "United States"
+    default_targets = [{"keyword": term, "country": default_country} for term in default_terms]
+    
     api_key = INTERNAL_SERVICE_API_KEY
     if not api_key:
         logger.warning("INTERNAL_SERVICE_API_KEY not configured in .env. Using default SEARCH_TERMS.")
-        return default_terms
+        return default_targets
         
-    endpoint = f"{CRM_BACKEND_URL}/api/clients/active"
+    endpoint_path = os.getenv("CRM_ENDPOINT_PATH", "/api/clients/active").strip()
+    if not endpoint_path.startswith("/"):
+        endpoint_path = "/" + endpoint_path
+    endpoint = f"{CRM_BACKEND_URL}{endpoint_path}"
+    
     headers = {
         "x-api-key": api_key,
         "Content-Type": "application/json"
@@ -635,32 +649,56 @@ async def fetch_desired_job_titles_from_active_clients():
             res = await client.get(endpoint, headers=headers)
             if res.status_code == 200:
                 result = res.json()
-                if result.get("success"):
-                    active_clients = result.get("data", [])
-                    keywords = []
-                    for client_item in active_clients:
-                        titles = client_item.get("desired_job_titles") or []
-                        if isinstance(titles, list):
-                            for title in titles:
-                                if isinstance(title, str) and title.strip():
-                                    clean_title = title.strip()
-                                    if clean_title not in keywords:
-                                        keywords.append(clean_title)
-                    if keywords:
-                        logger.info(f"✅ Successfully fetched {len(keywords)} desired job title(s) across {len(active_clients)} active client(s): {keywords}")
-                        return keywords
-                    else:
-                        logger.warning("No desired_job_titles found in active clients response. Using default SEARCH_TERMS.")
-                        return default_terms
+                
+                # Unwrap if wrapped in {"success": true, "data": ...}
+                payload_data = result.get("data", result) if isinstance(result, dict) and "data" in result else result
+                
+                # Normalize payload_data to list of dictionaries
+                items = payload_data if isinstance(payload_data, list) else [payload_data]
+                
+                search_targets = []
+                seen_pairs = set()
+                
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                        
+                    # 1. Extract country / location
+                    raw_country = item.get("country") or item.get("country_name") or item.get("location") or default_country
+                    clean_country = raw_country.strip() if isinstance(raw_country, str) and raw_country.strip() else default_country
+                    
+                    # 2. Extract desired_job_titles (or fallback to domain)
+                    titles = item.get("desired_job_titles") or []
+                    if not titles and item.get("domain"):
+                        titles = [item.get("domain")]
+                    if isinstance(titles, str):
+                        titles = [titles]
+                        
+                    if isinstance(titles, list):
+                        for title in titles:
+                            if isinstance(title, str) and title.strip():
+                                clean_title = title.strip()
+                                # Deduplicate by (keyword, country) pair:
+                                pair_key = (clean_title.lower(), clean_country.lower())
+                                if pair_key not in seen_pairs:
+                                    seen_pairs.add(pair_key)
+                                    search_targets.append({
+                                        "keyword": clean_title,
+                                        "country": clean_country
+                                    })
+                
+                if search_targets:
+                    logger.info(f"✅ Successfully prepared {len(search_targets)} unique search target(s) across countries: {search_targets}")
+                    return search_targets
                 else:
-                    logger.error(f"Active clients API returned error: {result.get('message')}. Using default SEARCH_TERMS.")
-                    return default_terms
+                    logger.warning("No search targets found in response. Using default SEARCH_TERMS.")
+                    return default_targets
             else:
-                logger.error(f"Failed to fetch active clients from {endpoint}: HTTP {res.status_code} - {res.text}. Using default SEARCH_TERMS.")
-                return default_terms
+                logger.error(f"Failed to fetch from {endpoint}: HTTP {res.status_code} - {res.text}. Using default SEARCH_TERMS.")
+                return default_targets
     except Exception as e:
-        logger.error(f"Error connecting to active clients API at {endpoint}: {e}. Using default SEARCH_TERMS.")
-        return default_terms
+        logger.error(f"Error connecting to endpoint at {endpoint}: {e}. Using default SEARCH_TERMS.")
+        return default_targets
 
 # Maintain backward compatibility alias
 fetch_primary_functions_from_supabase = fetch_desired_job_titles_from_active_clients
@@ -870,12 +908,12 @@ save_to_supabase = save_to_neon
 async def main():
     logger.info("Starting Dice Route Scraper (HTTP Route Access)...")
     
-    search_terms = await fetch_desired_job_titles_from_active_clients()
-    if MAX_KEYWORDS and len(search_terms) > MAX_KEYWORDS:
-        search_terms = search_terms[:MAX_KEYWORDS]
-        logger.info(f"Limited search keywords to first {MAX_KEYWORDS}: {search_terms}")
+    search_targets = await fetch_desired_job_titles_from_active_clients()
+    if MAX_KEYWORDS and len(search_targets) > MAX_KEYWORDS:
+        search_targets = search_targets[:MAX_KEYWORDS]
+        logger.info(f"Limited search targets to first {MAX_KEYWORDS}: {search_targets}")
     else:
-        logger.info(f"Target scraping keywords / job titles ({len(search_terms)}): {search_terms}")
+        logger.info(f"Target scraping targets ({len(search_targets)}): {search_targets}")
     
     all_results = []
     limits = httpx.Limits(max_keepalive_connections=20, max_connections=30)
@@ -888,111 +926,115 @@ async def main():
         logger.info("No Webshare proxy configured in .env. Using direct connection.")
 
     try:
-        for term in search_terms:
-            logger.info(f"=== Starting scrape for keyword: '{term}' (Target: up to {MAX_JOBS_PER_KEYWORD or 'unlimited'} jobs) ===")
+        for target in search_targets:
+            if isinstance(target, dict):
+                term = target.get("keyword")
+                country = target.get("country") or (LOCATIONS[0] if LOCATIONS else "United States")
+            else:
+                term = target
+                country = LOCATIONS[0] if LOCATIONS else "United States"
+
+            logger.info(f"=== Starting scrape for keyword: '{term}' in '{country}' (Target: up to {MAX_JOBS_PER_KEYWORD or 'unlimited'} jobs) ===")
             term_count = 0
-            for loc in LOCATIONS:
+            page_num = 1
+            
+            while True:
                 if MAX_JOBS_PER_KEYWORD and term_count >= MAX_JOBS_PER_KEYWORD:
                     break
-                page_num = 1
+
+                date_filter = "&filters.postedDate=ONE" if ONLY_LAST_24_HOURS else ""
+                search_url = f"https://www.dice.com/jobs?q={urllib.parse.quote_plus(term)}&location={urllib.parse.quote_plus(country)}{date_filter}&page={page_num}"
                 
-                while True:
+                # Fetch search route with proxy rotation & retry
+                res = None
+                max_search_attempts = min(3, proxy_rotator.total()) if proxy_rotator.has_proxies() else 1
+                for attempt in range(max_search_attempts):
+                    client, proxy_label = await proxy_rotator.get_client()
+                    logger.info(f"Accessing Search Route for '{term}' in '{country}' (Page {page_num}) via {proxy_label}: {search_url}")
+                    try:
+                        r = await client.get(search_url)
+                        if r.status_code == 200:
+                            res = r
+                            break
+                        elif r.status_code in [403, 429] and attempt < max_search_attempts - 1:
+                            logger.warning(f"Search route HTTP {r.status_code} with {proxy_label}. Rotating proxy and retrying...")
+                            await asyncio.sleep(2)
+                        else:
+                            logger.error(f"Search route returned status {r.status_code}")
+                            res = r
+                            break
+                    except httpx.RequestError as e:
+                        logger.warning(f"Connection error on search route with {proxy_label}: {e}. Rotating proxy...")
+                        await asyncio.sleep(1)
+
+                if not res or res.status_code != 200:
+                    break
+
+                # Wait 3 seconds after search page request
+                await asyncio.sleep(3)
+
+                soup = BeautifulSoup(res.text, 'html.parser')
+                job_links = []
+                for a in soup.find_all('a', href=True):
+                    href = a['href']
+                    if '/job-detail/' in href:
+                        if not href.startswith('http'):
+                            href = 'https://www.dice.com' + href
+                        if href not in job_links:
+                            job_links.append(href)
+                            
+                if not job_links:
+                    logger.info(f"No more job links found on page {page_num}. Finished search for '{term}' in '{country}'.")
+                    break
+                
+                logger.info(f"Found {len(job_links)} jobs on page {page_num} for '{term}' in '{country}'. Processing...")
+                
+                for link in job_links:
                     if MAX_JOBS_PER_KEYWORD and term_count >= MAX_JOBS_PER_KEYWORD:
                         break
-
-                    date_filter = "&filters.postedDate=ONE" if ONLY_LAST_24_HOURS else ""
-                    search_url = f"https://www.dice.com/jobs?q={urllib.parse.quote_plus(term)}&location={urllib.parse.quote_plus(loc)}{date_filter}&page={page_num}"
                     
-                    # Fetch search route with proxy rotation & retry
-                    res = None
-                    max_search_attempts = min(3, proxy_rotator.total()) if proxy_rotator.has_proxies() else 1
-                    for attempt in range(max_search_attempts):
+                    # Fetch job detail with proxy rotation and retry
+                    job_data = None
+                    max_job_attempts = min(3, proxy_rotator.total()) if proxy_rotator.has_proxies() else 1
+                    for attempt in range(max_job_attempts):
                         client, proxy_label = await proxy_rotator.get_client()
-                        logger.info(f"Accessing Search Route for '{term}' (Page {page_num}) via {proxy_label}: {search_url}")
                         try:
-                            r = await client.get(search_url)
-                            if r.status_code == 200:
-                                res = r
+                            job_data = await fetch_job_detail(client, link, term, country)
+                            if job_data:
                                 break
-                            elif r.status_code in [403, 429] and attempt < max_search_attempts - 1:
-                                logger.warning(f"Search route HTTP {r.status_code} with {proxy_label}. Rotating proxy and retrying...")
-                                await asyncio.sleep(2)
+                            elif attempt < max_job_attempts - 1:
+                                logger.warning(f"Fetch empty with {proxy_label}, rotating proxy for retry ({attempt+1}/{max_job_attempts})...")
+                                await asyncio.sleep(1)
+                        except httpx.RequestError as req_err:
+                            if attempt < max_job_attempts - 1:
+                                logger.warning(f"Proxy network error with {proxy_label}: {req_err}. Rotating proxy...")
+                                await asyncio.sleep(1)
                             else:
-                                logger.error(f"Search route returned status {r.status_code}")
-                                res = r
-                                break
-                        except httpx.RequestError as e:
-                            logger.warning(f"Connection error on search route with {proxy_label}: {e}. Rotating proxy...")
-                            await asyncio.sleep(1)
+                                logger.error(f"Failed to fetch {link} after {max_job_attempts} attempts: {req_err}")
+                        except Exception as unexpected:
+                            logger.error(f"Unexpected error parsing {link}: {unexpected}")
+                            break
 
-                    if not res or res.status_code != 200:
-                        break
+                    if job_data:
+                        all_results.append(job_data)
+                        term_count += 1
+                        
+                        # Phase 1: Store incrementally in CSV file only
+                        df = pd.DataFrame(all_results)
+                        df.to_csv(OUTPUT_FILE, index=False)
+                        logger.info(f"[{term} @ {country}] Saved {term_count} / {MAX_JOBS_PER_KEYWORD or 'all'} jobs (Total scraped: {len(all_results)}) to CSV: {OUTPUT_FILE}")
 
-                    # Wait 3 seconds after search page request
-                    await asyncio.sleep(3)
-
-                    soup = BeautifulSoup(res.text, 'html.parser')
-                    job_links = []
-                    for a in soup.find_all('a', href=True):
-                        href = a['href']
-                        if '/job-detail/' in href:
-                            if not href.startswith('http'):
-                                href = 'https://www.dice.com' + href
-                            if href not in job_links:
-                                job_links.append(href)
-                                
-                    if not job_links:
-                        logger.info(f"No more job links found on page {page_num}. Finished search for '{term}' in {loc}.")
-                        break
-                    
-                    logger.info(f"Found {len(job_links)} jobs on page {page_num} for '{term}'. Processing...")
-                    
-                    for link in job_links:
                         if MAX_JOBS_PER_KEYWORD and term_count >= MAX_JOBS_PER_KEYWORD:
+                            logger.info(f"Reached target limit of {MAX_JOBS_PER_KEYWORD} jobs for keyword '{term}' in '{country}'. Moving to next target.")
                             break
                         
-                        # Fetch job detail with proxy rotation and retry
-                        job_data = None
-                        max_job_attempts = min(3, proxy_rotator.total()) if proxy_rotator.has_proxies() else 1
-                        for attempt in range(max_job_attempts):
-                            client, proxy_label = await proxy_rotator.get_client()
-                            try:
-                                job_data = await fetch_job_detail(client, link, term)
-                                if job_data:
-                                    break
-                                elif attempt < max_job_attempts - 1:
-                                    logger.warning(f"Fetch empty with {proxy_label}, rotating proxy for retry ({attempt+1}/{max_job_attempts})...")
-                                    await asyncio.sleep(1)
-                            except httpx.RequestError as req_err:
-                                if attempt < max_job_attempts - 1:
-                                    logger.warning(f"Proxy network error with {proxy_label}: {req_err}. Rotating proxy...")
-                                    await asyncio.sleep(1)
-                                else:
-                                    logger.error(f"Failed to fetch {link} after {max_job_attempts} attempts: {req_err}")
-                            except Exception as unexpected:
-                                logger.error(f"Unexpected error parsing {link}: {unexpected}")
-                                break
+                    # Wait 3 seconds before next request
+                    await asyncio.sleep(3)
+                    
+                if MAX_JOBS_PER_KEYWORD and term_count >= MAX_JOBS_PER_KEYWORD:
+                    break
 
-                        if job_data:
-                            all_results.append(job_data)
-                            term_count += 1
-                            
-                            # Phase 1: Store incrementally in CSV file only
-                            df = pd.DataFrame(all_results)
-                            df.to_csv(OUTPUT_FILE, index=False)
-                            logger.info(f"[{term}] Saved {term_count} / {MAX_JOBS_PER_KEYWORD or 'all'} jobs (Total scraped across all keywords: {len(all_results)}) to CSV: {OUTPUT_FILE}")
-
-                            if MAX_JOBS_PER_KEYWORD and term_count >= MAX_JOBS_PER_KEYWORD:
-                                logger.info(f"Reached target limit of {MAX_JOBS_PER_KEYWORD} jobs for keyword '{term}'. Moving to next keyword.")
-                                break
-                            
-                        # Wait 3 seconds before next request
-                        await asyncio.sleep(3)
-                        
-                    if MAX_JOBS_PER_KEYWORD and term_count >= MAX_JOBS_PER_KEYWORD:
-                        break
-
-                    page_num += 1
+                page_num += 1
 
     finally:
         await proxy_rotator.close_all()
