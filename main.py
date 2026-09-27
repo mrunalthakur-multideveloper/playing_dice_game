@@ -25,7 +25,14 @@ if os.path.exists(_env_path):
     load_dotenv(dotenv_path=_env_path)
 load_dotenv()
 
-# Configure logging with real-time unbuffered flushing (essential for Google Colab)
+# Ensure stdout supports UTF-8 on Windows consoles
+if hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
+# Configure logging with real-time unbuffered flushing (essential for Google Colab and consoles)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
