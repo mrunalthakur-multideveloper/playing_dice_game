@@ -25,7 +25,7 @@
             "title": "Max Jobs",
             "type": "integer",
             "description": "Maximum number of jobs to scrape.",
-            "default": 20
+            "default": 150
         },
         "proxyConfiguration": {
             "title": "Proxy Configuration",

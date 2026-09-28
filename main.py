@@ -45,12 +45,16 @@ logger.setLevel(logging.INFO)
 # Constants & Configuration
 SEARCH_TERMS = ["software engineer"]
 LOCATIONS = ["San Francisco, CA"]
-# Scrape limit per keyword: defaults to 100 (configurable via MAX_JOBS_PER_KEYWORD or MAX_JOBS env var)
-_env_max = os.getenv("MAX_JOBS_PER_KEYWORD", os.getenv("MAX_JOBS", "100")).strip()
-MAX_JOBS_PER_KEYWORD = int(_env_max) if _env_max.isdigit() and int(_env_max) > 0 else (None if _env_max.lower() in ["none", "0", "unlimited"] else 100)
+# Scrape limit per keyword: defaults to 150 (configurable via MAX_JOBS_PER_KEYWORD or MAX_JOBS env var)
+_env_max = os.getenv("MAX_JOBS_PER_KEYWORD", os.getenv("MAX_JOBS", "150")).strip()
+MAX_JOBS_PER_KEYWORD = int(_env_max) if _env_max.isdigit() and int(_env_max) > 0 else (None if _env_max.lower() in ["none", "0", "unlimited"] else 150)
 MAX_JOBS = MAX_JOBS_PER_KEYWORD
 
-# Max search keywords to scrape: configurable via MAX_KEYWORDS env var (e.g. 5, or None for all)
+# Max active client members to process from CRM: configurable via MAX_MEMBERS env var (defaults to 15)
+_env_members = os.getenv("MAX_MEMBERS", "15").strip()
+MAX_MEMBERS = int(_env_members) if _env_members.isdigit() and int(_env_members) > 0 else None
+
+# Max search keywords to scrape: None means scrape all keywords (configurable via MAX_KEYWORDS env var)
 _env_keywords = os.getenv("MAX_KEYWORDS", "").strip()
 MAX_KEYWORDS = int(_env_keywords) if _env_keywords.isdigit() and int(_env_keywords) > 0 else None
 
@@ -663,6 +667,12 @@ async def fetch_desired_job_titles_from_active_clients():
                 # Normalize payload_data to list of dictionaries
                 items = payload_data if isinstance(payload_data, list) else [payload_data]
                 
+                if MAX_MEMBERS and len(items) > MAX_MEMBERS:
+                    logger.info(f"Limiting active CRM members to first {MAX_MEMBERS} (out of {len(items)} active members).")
+                    items = items[:MAX_MEMBERS]
+                else:
+                    logger.info(f"Processing {len(items)} active member(s) from CRM.")
+
                 search_targets = []
                 seen_pairs = set()
                 
