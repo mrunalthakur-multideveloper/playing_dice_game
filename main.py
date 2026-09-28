@@ -956,7 +956,7 @@ async def main():
         logger.info(f"Target scraping targets ({len(search_targets)}): {search_targets}")
     
     all_results = []
-    limits = httpx.Limits(max_keepalive_connections=20, max_connections=30)
+    limits = httpx.Limits(max_keepalive_connections=30, max_connections=50)
     webshare_proxies = load_webshare_proxies()
     proxy_rotator = ProxyRotator(webshare_proxies, headers=HEADERS, limits=limits)
 
@@ -965,8 +965,46 @@ async def main():
     else:
         logger.info("No Webshare proxy configured in .env. Using direct connection.")
 
+    async def fetch_job_with_retry(link, term, country):
+        """Fetch a single job detail with proxy rotation, 402 detection, and direct fallback."""
+        max_job_attempts = min(3, proxy_rotator.total()) if proxy_rotator.has_proxies() else 1
+        for attempt in range(max_job_attempts):
+            client, proxy_label = await proxy_rotator.get_client()
+            try:
+                job_data = await fetch_job_detail(client, link, term, country)
+                if job_data:
+                    return job_data
+                elif attempt < max_job_attempts - 1:
+                    logger.warning(f"Fetch empty with {proxy_label}, rotating proxy for retry ({attempt+1}/{max_job_attempts})...")
+                    await asyncio.sleep(1)
+            except httpx.RequestError as req_err:
+                err_str = str(req_err)
+                if "402" in err_str or "payment required" in err_str.lower():
+                    proxy_rotator.remove_failing_proxy(proxy_label, "Webshare 402 Payment Required - Bandwidth/Plan Expired")
+                    break
+                elif "407" in err_str or "authentication" in err_str.lower():
+                    proxy_rotator.remove_failing_proxy(proxy_label, "Proxy 407 Auth Failed")
+                    break
+                elif attempt < max_job_attempts - 1:
+                    logger.warning(f"Proxy network error with {proxy_label}: {req_err}. Rotating proxy...")
+                    await asyncio.sleep(1)
+                else:
+                    logger.error(f"Failed to fetch {link} after {max_job_attempts} attempts: {req_err}")
+            except Exception as unexpected:
+                logger.error(f"Unexpected error parsing {link}: {unexpected}")
+                break
+
+        # Fallback to direct connection if proxies failed or exhausted
+        if not proxy_rotator.has_proxies():
+            direct_client, direct_label = await proxy_rotator.get_direct_client()
+            try:
+                return await fetch_job_detail(direct_client, link, term, country)
+            except Exception as direct_err:
+                logger.error(f"Direct fetch failed for {link}: {direct_err}")
+        return None
+
     try:
-        for target in search_targets:
+        for target_idx, target in enumerate(search_targets):
             if isinstance(target, dict):
                 term = target.get("keyword")
                 country = target.get("country") or (LOCATIONS[0] if LOCATIONS else "United States")
@@ -974,145 +1012,123 @@ async def main():
                 term = target
                 country = LOCATIONS[0] if LOCATIONS else "United States"
 
-            logger.info(f"=== Starting scrape for keyword: '{term}' in '{country}' (Target: up to {MAX_JOBS_PER_KEYWORD or 'unlimited'} jobs) ===")
+            logger.info(f"=== Starting scrape for keyword [{target_idx+1}/{len(search_targets)}]: '{term}' in '{country}' (Target: up to {MAX_JOBS_PER_KEYWORD or 'unlimited'} jobs) ===")
             term_count = 0
             page_num = 1
-            
-            while True:
-                if MAX_JOBS_PER_KEYWORD and term_count >= MAX_JOBS_PER_KEYWORD:
-                    break
+            pending_links = []
+            no_more_pages = False
 
-                date_filter = "&filters.postedDate=ONE" if ONLY_LAST_24_HOURS else ""
-                search_url = f"https://www.dice.com/jobs?q={urllib.parse.quote_plus(term)}&location={urllib.parse.quote_plus(country)}{date_filter}&page={page_num}"
-                
-                # Fetch search route with proxy rotation & retry
-                res = None
-                max_search_attempts = min(3, proxy_rotator.total()) if proxy_rotator.has_proxies() else 1
-                for attempt in range(max_search_attempts):
-                    client, proxy_label = await proxy_rotator.get_client()
-                    logger.info(f"Accessing Search Route for '{term}' in '{country}' (Page {page_num}) via {proxy_label}: {search_url}")
-                    try:
-                        r = await client.get(search_url)
-                        if r.status_code == 200:
-                            res = r
-                            break
-                        elif r.status_code in [403, 429] and attempt < max_search_attempts - 1:
-                            logger.warning(f"Search route HTTP {r.status_code} with {proxy_label}. Rotating proxy and retrying...")
-                            await asyncio.sleep(2)
-                        elif r.status_code == 402:
-                            proxy_rotator.remove_failing_proxy(proxy_label, "Webshare 402 Payment Required - Bandwidth/Plan Expired")
-                            break
-                        else:
-                            logger.error(f"Search route returned status {r.status_code}")
-                            res = r
-                            break
-                    except httpx.RequestError as e:
-                        err_str = str(e)
-                        if "402" in err_str or "payment required" in err_str.lower():
-                            proxy_rotator.remove_failing_proxy(proxy_label, "Webshare 402 Payment Required - Bandwidth/Plan Expired")
-                            break
-                        elif "407" in err_str or "authentication" in err_str.lower():
-                            proxy_rotator.remove_failing_proxy(proxy_label, "Proxy 407 Auth Failed")
-                            break
-                        else:
-                            logger.warning(f"Connection error on search route with {proxy_label}: {e}. Rotating proxy...")
-                        await asyncio.sleep(1)
-
-                # Fallback to direct connection if proxies failed or exhausted
-                if (not res or res.status_code != 200) and not proxy_rotator.has_proxies():
-                    direct_client, direct_label = await proxy_rotator.get_direct_client()
-                    logger.info(f"Attempting search route via {direct_label} for '{term}' in '{country}' (Page {page_num})...")
-                    try:
-                        r = await direct_client.get(search_url)
-                        if r.status_code == 200:
-                            res = r
-                            logger.info(f"✅ Successfully fetched search page via {direct_label}!")
-                    except Exception as direct_err:
-                        logger.error(f"Direct connection search request failed: {direct_err}")
-
-                if not res or res.status_code != 200:
-                    break
-
-                # Wait 3 seconds after search page request
-                await asyncio.sleep(3)
-
-                soup = BeautifulSoup(res.text, 'html.parser')
-                job_links = []
-                for a in soup.find_all('a', href=True):
-                    href = a['href']
-                    if '/job-detail/' in href:
-                        if not href.startswith('http'):
-                            href = 'https://www.dice.com' + href
-                        if href not in job_links:
-                            job_links.append(href)
-                            
-                if not job_links:
-                    logger.info(f"No more job links found on page {page_num}. Finished search for '{term}' in '{country}'.")
-                    break
-                
-                logger.info(f"Found {len(job_links)} jobs on page {page_num} for '{term}' in '{country}'. Processing...")
-                
-                for link in job_links:
-                    if MAX_JOBS_PER_KEYWORD and term_count >= MAX_JOBS_PER_KEYWORD:
-                        break
+            while term_count < (MAX_JOBS_PER_KEYWORD or float('inf')):
+                # Fetch more search pages until we have at least 15 pending links
+                while len(pending_links) < 15 and not no_more_pages:
+                    date_filter = "&filters.postedDate=ONE" if ONLY_LAST_24_HOURS else ""
+                    search_url = f"https://www.dice.com/jobs?q={urllib.parse.quote_plus(term)}&location={urllib.parse.quote_plus(country)}{date_filter}&page={page_num}"
                     
-                    # Fetch job detail with proxy rotation and retry
-                    job_data = None
-                    max_job_attempts = min(3, proxy_rotator.total()) if proxy_rotator.has_proxies() else 1
-                    for attempt in range(max_job_attempts):
+                    res = None
+                    max_search_attempts = min(3, proxy_rotator.total()) if proxy_rotator.has_proxies() else 1
+                    for attempt in range(max_search_attempts):
                         client, proxy_label = await proxy_rotator.get_client()
+                        logger.info(f"Accessing Search Route for '{term}' in '{country}' (Page {page_num}) via {proxy_label}: {search_url}")
                         try:
-                            job_data = await fetch_job_detail(client, link, term, country)
-                            if job_data:
+                            r = await client.get(search_url)
+                            if r.status_code == 200:
+                                res = r
                                 break
-                            elif attempt < max_job_attempts - 1:
-                                logger.warning(f"Fetch empty with {proxy_label}, rotating proxy for retry ({attempt+1}/{max_job_attempts})...")
-                                await asyncio.sleep(1)
-                        except httpx.RequestError as req_err:
-                            err_str = str(req_err)
+                            elif r.status_code in [403, 429] and attempt < max_search_attempts - 1:
+                                logger.warning(f"Search route HTTP {r.status_code} with {proxy_label}. Rotating proxy and retrying...")
+                                await asyncio.sleep(2)
+                            elif r.status_code == 402:
+                                proxy_rotator.remove_failing_proxy(proxy_label, "Webshare 402 Payment Required - Bandwidth/Plan Expired")
+                                break
+                            else:
+                                logger.error(f"Search route returned status {r.status_code}")
+                                res = r
+                                break
+                        except httpx.RequestError as e:
+                            err_str = str(e)
                             if "402" in err_str or "payment required" in err_str.lower():
                                 proxy_rotator.remove_failing_proxy(proxy_label, "Webshare 402 Payment Required - Bandwidth/Plan Expired")
                                 break
                             elif "407" in err_str or "authentication" in err_str.lower():
                                 proxy_rotator.remove_failing_proxy(proxy_label, "Proxy 407 Auth Failed")
                                 break
-                            elif attempt < max_job_attempts - 1:
-                                logger.warning(f"Proxy network error with {proxy_label}: {req_err}. Rotating proxy...")
-                                await asyncio.sleep(1)
                             else:
-                                logger.error(f"Failed to fetch {link} after {max_job_attempts} attempts: {req_err}")
-                        except Exception as unexpected:
-                            logger.error(f"Unexpected error parsing {link}: {unexpected}")
-                            break
+                                logger.warning(f"Connection error on search route with {proxy_label}: {e}. Rotating proxy...")
+                            await asyncio.sleep(1)
 
                     # Fallback to direct connection if proxies failed or exhausted
-                    if not job_data and not proxy_rotator.has_proxies():
+                    if (not res or res.status_code != 200) and not proxy_rotator.has_proxies():
                         direct_client, direct_label = await proxy_rotator.get_direct_client()
+                        logger.info(f"Attempting search route via {direct_label} for '{term}' in '{country}' (Page {page_num})...")
                         try:
-                            job_data = await fetch_job_detail(direct_client, link, term, country)
+                            r = await direct_client.get(search_url)
+                            if r.status_code == 200:
+                                res = r
+                                logger.info(f"✅ Successfully fetched search page via {direct_label}!")
                         except Exception as direct_err:
-                            logger.error(f"Direct fetch failed for {link}: {direct_err}")
+                            logger.error(f"Direct connection search request failed: {direct_err}")
 
+                    if not res or res.status_code != 200:
+                        no_more_pages = True
+                        break
+
+                    soup = BeautifulSoup(res.text, 'html.parser')
+                    page_job_links = []
+                    for a in soup.find_all('a', href=True):
+                        href = a['href']
+                        if '/job-detail/' in href:
+                            if not href.startswith('http'):
+                                href = 'https://www.dice.com' + href
+                            if href not in page_job_links and href not in pending_links:
+                                page_job_links.append(href)
+
+                    if not page_job_links:
+                        logger.info(f"No more job links found on page {page_num} for '{term}' in '{country}'.")
+                        no_more_pages = True
+                        break
+
+                    pending_links.extend(page_job_links)
+                    logger.info(f"Found {len(page_job_links)} jobs on page {page_num}. Total queued for batching: {len(pending_links)}")
+                    page_num += 1
+                    await asyncio.sleep(1)
+
+                if not pending_links:
+                    logger.info(f"No more job links available for '{term}' in '{country}'. Completed keyword search.")
+                    break
+
+                # Fetch 15 jobs per batch (or remaining needed up to 15)
+                needed = (MAX_JOBS_PER_KEYWORD - term_count) if MAX_JOBS_PER_KEYWORD else 15
+                current_batch_size = min(15, needed, len(pending_links))
+                batch = pending_links[:current_batch_size]
+                pending_links = pending_links[current_batch_size:]
+
+                logger.info(f"[{term} @ {country}] ⚡ Fetching batch of {len(batch)} jobs (Target: 15 jobs per 5s)...")
+                batch_results = await asyncio.gather(*[fetch_job_with_retry(l, term, country) for l in batch])
+
+                for job_data in batch_results:
                     if job_data:
                         all_results.append(job_data)
                         term_count += 1
-                        
-                        # Phase 1: Store incrementally in CSV file only
-                        df = pd.DataFrame(all_results)
-                        df.to_csv(OUTPUT_FILE, index=False)
-                        logger.info(f"[{term} @ {country}] Saved {term_count} / {MAX_JOBS_PER_KEYWORD or 'all'} jobs (Total scraped: {len(all_results)}) to CSV: {OUTPUT_FILE}")
-
                         if MAX_JOBS_PER_KEYWORD and term_count >= MAX_JOBS_PER_KEYWORD:
-                            logger.info(f"Reached target limit of {MAX_JOBS_PER_KEYWORD} jobs for keyword '{term}' in '{country}'. Moving to next target.")
                             break
-                        
-                    # Wait 3 seconds before next request
-                    await asyncio.sleep(3)
-                    
+
+                if all_results:
+                    df = pd.DataFrame(all_results)
+                    df.to_csv(OUTPUT_FILE, index=False)
+                    logger.info(f"[{term} @ {country}] Saved {term_count} / {MAX_JOBS_PER_KEYWORD or 'all'} jobs (Total scraped: {len(all_results)}) to CSV: {OUTPUT_FILE}")
+
                 if MAX_JOBS_PER_KEYWORD and term_count >= MAX_JOBS_PER_KEYWORD:
+                    logger.info(f"🎯 Reached target limit of {MAX_JOBS_PER_KEYWORD} jobs for keyword '{term}' in '{country}'.")
                     break
 
-                page_num += 1
+                if pending_links or not no_more_pages:
+                    logger.info("⏱️ Batch finished. Pausing 5 seconds before fetching next 15 jobs...")
+                    await asyncio.sleep(5)
+
+            # Keyword finished: stop/pause up to 30 seconds before next keyword
+            if target_idx < len(search_targets) - 1:
+                logger.info(f"⏸️ Finished keyword '{term}' in '{country}' ({term_count} jobs). Pausing 30 seconds before next keyword...")
+                await asyncio.sleep(30)
 
     finally:
         await proxy_rotator.close_all()
