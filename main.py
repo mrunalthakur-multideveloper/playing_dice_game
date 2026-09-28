@@ -169,7 +169,7 @@ def load_webshare_proxies() -> list:
 class ProxyRotator:
     """Manages Webshare proxies with round-robin rotation, client pooling, and safe fallback."""
     def __init__(self, proxies: list, headers: dict, limits: httpx.Limits):
-        self.proxies = proxies
+        self.proxies = list(proxies)
         self.index = 0
         self.headers = headers
         self.limits = limits
@@ -182,17 +182,40 @@ class ProxyRotator:
     def total(self) -> int:
         return len(self.proxies)
 
+    async def get_direct_client(self):
+        """Returns direct connection client (no proxy)."""
+        if self._direct_client is None or self._direct_client.is_closed:
+            self._direct_client = httpx.AsyncClient(
+                headers=self.headers,
+                limits=self.limits,
+                follow_redirects=True,
+                timeout=30.0
+            )
+        return self._direct_client, "Direct (No Proxy)"
+
+    def remove_failing_proxy(self, proxy_label: str, reason: str = ""):
+        """Permanently remove an exhausted or dead proxy from rotation and fallback to direct."""
+        to_remove = []
+        for p in self.proxies:
+            if mask_proxy(p) == proxy_label or proxy_label in mask_proxy(p) or p in proxy_label:
+                to_remove.append(p)
+        for p in to_remove:
+            if p in self.proxies:
+                self.proxies.remove(p)
+            if p in self._clients:
+                try:
+                    client = self._clients.pop(p)
+                    asyncio.create_task(client.aclose())
+                except Exception:
+                    pass
+            logger.warning(f"⚠️ Removed proxy {mask_proxy(p)} from rotation ({reason}). {len(self.proxies)} proxy(ies) remaining.")
+        if not self.proxies:
+            logger.warning("⚠️ No valid proxies remaining in rotation. Automatically switching to Direct Connection (No Proxy)!")
+
     async def get_client(self):
         """Returns (client, proxy_label) with round-robin rotation."""
         if not self.proxies:
-            if self._direct_client is None or self._direct_client.is_closed:
-                self._direct_client = httpx.AsyncClient(
-                    headers=self.headers,
-                    limits=self.limits,
-                    follow_redirects=True,
-                    timeout=30.0
-                )
-            return self._direct_client, "Direct (No Proxy)"
+            return await self.get_direct_client()
 
         proxy = self.proxies[self.index % len(self.proxies)]
         self.index += 1
@@ -976,13 +999,36 @@ async def main():
                         elif r.status_code in [403, 429] and attempt < max_search_attempts - 1:
                             logger.warning(f"Search route HTTP {r.status_code} with {proxy_label}. Rotating proxy and retrying...")
                             await asyncio.sleep(2)
+                        elif r.status_code == 402:
+                            proxy_rotator.remove_failing_proxy(proxy_label, "Webshare 402 Payment Required - Bandwidth/Plan Expired")
+                            break
                         else:
                             logger.error(f"Search route returned status {r.status_code}")
                             res = r
                             break
                     except httpx.RequestError as e:
-                        logger.warning(f"Connection error on search route with {proxy_label}: {e}. Rotating proxy...")
+                        err_str = str(e)
+                        if "402" in err_str or "payment required" in err_str.lower():
+                            proxy_rotator.remove_failing_proxy(proxy_label, "Webshare 402 Payment Required - Bandwidth/Plan Expired")
+                            break
+                        elif "407" in err_str or "authentication" in err_str.lower():
+                            proxy_rotator.remove_failing_proxy(proxy_label, "Proxy 407 Auth Failed")
+                            break
+                        else:
+                            logger.warning(f"Connection error on search route with {proxy_label}: {e}. Rotating proxy...")
                         await asyncio.sleep(1)
+
+                # Fallback to direct connection if proxies failed or exhausted
+                if (not res or res.status_code != 200) and not proxy_rotator.has_proxies():
+                    direct_client, direct_label = await proxy_rotator.get_direct_client()
+                    logger.info(f"Attempting search route via {direct_label} for '{term}' in '{country}' (Page {page_num})...")
+                    try:
+                        r = await direct_client.get(search_url)
+                        if r.status_code == 200:
+                            res = r
+                            logger.info(f"✅ Successfully fetched search page via {direct_label}!")
+                    except Exception as direct_err:
+                        logger.error(f"Direct connection search request failed: {direct_err}")
 
                 if not res or res.status_code != 200:
                     break
@@ -1023,7 +1069,14 @@ async def main():
                                 logger.warning(f"Fetch empty with {proxy_label}, rotating proxy for retry ({attempt+1}/{max_job_attempts})...")
                                 await asyncio.sleep(1)
                         except httpx.RequestError as req_err:
-                            if attempt < max_job_attempts - 1:
+                            err_str = str(req_err)
+                            if "402" in err_str or "payment required" in err_str.lower():
+                                proxy_rotator.remove_failing_proxy(proxy_label, "Webshare 402 Payment Required - Bandwidth/Plan Expired")
+                                break
+                            elif "407" in err_str or "authentication" in err_str.lower():
+                                proxy_rotator.remove_failing_proxy(proxy_label, "Proxy 407 Auth Failed")
+                                break
+                            elif attempt < max_job_attempts - 1:
                                 logger.warning(f"Proxy network error with {proxy_label}: {req_err}. Rotating proxy...")
                                 await asyncio.sleep(1)
                             else:
@@ -1031,6 +1084,14 @@ async def main():
                         except Exception as unexpected:
                             logger.error(f"Unexpected error parsing {link}: {unexpected}")
                             break
+
+                    # Fallback to direct connection if proxies failed or exhausted
+                    if not job_data and not proxy_rotator.has_proxies():
+                        direct_client, direct_label = await proxy_rotator.get_direct_client()
+                        try:
+                            job_data = await fetch_job_detail(direct_client, link, term, country)
+                        except Exception as direct_err:
+                            logger.error(f"Direct fetch failed for {link}: {direct_err}")
 
                     if job_data:
                         all_results.append(job_data)
