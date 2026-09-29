@@ -844,10 +844,35 @@ def _init_neon_table(conn, table_name):
         logger.warning(f"Notice on Neon table initialization for '{table_name}': {e}")
 
 
+def get_existing_db_job_ids() -> set:
+    """Fetch all existing unique job_ids from Neon DB table to prevent re-scraping/re-inserting duplicates."""
+    conn = get_neon_connection()
+    if not conn:
+        return set()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT job_id FROM {NEON_TABLE} WHERE job_id IS NOT NULL;")
+            rows = cur.fetchall()
+            return {r[0] for r in rows if r and r[0]}
+    except Exception as e:
+        logger.warning(f"Notice on reading existing DB job_ids: {e}")
+        return set()
+
+
 def _sync_save_to_neon(records):
     """Synchronous worker to upsert records into Neon PostgreSQL."""
     if not records:
         return
+
+    # Strictly deduplicate in-memory by job_id so a batch never contains duplicate rows
+    seen_ids = set()
+    deduped_records = []
+    for r in records:
+        jid = r.get("job_id")
+        if jid and jid not in seen_ids:
+            seen_ids.add(jid)
+            deduped_records.append(r)
+    records = deduped_records
 
     if not NEON_DATABASE_URL:
         logger.warning("Neon Database URL not configured in .env (NEON_DATABASE_URL or DATABASE_URL). Skipping Neon upload.")
@@ -1133,22 +1158,45 @@ async def main():
     finally:
         await proxy_rotator.close_all()
 
+    round1_job_ids = set()
     if all_results:
-        # Phase 1 complete: Final CSV Save with all scraped job links
-        df = pd.DataFrame(all_results)
+        # Phase 1: Strictly deduplicate by job_id to prevent duplicate rows in CSV
+        df = pd.DataFrame(all_results).drop_duplicates(subset=["job_id"], keep="last")
         df.to_csv(OUTPUT_FILE, index=False)
-        logger.info(f"✅ Scraping phase complete: Total {len(all_results)} jobs stored in CSV: {OUTPUT_FILE}")
+        round1_records = df.to_dict(orient="records")
+        round1_job_ids = set(df["job_id"].dropna().tolist())
+        logger.info(f"✅ Scraping phase complete: Total {len(round1_records)} unique jobs stored in CSV: {OUTPUT_FILE}")
         
-        # Phase 2: Store all scraped job links ONCE into Neon DB
-        logger.info(f"🚀 Storing all {len(all_results)} scraped jobs at once into Neon DB table '{NEON_TABLE}'...")
-        await save_to_neon(all_results)
-        logger.info(f"✅ All {len(all_results)} jobs stored in Neon DB table '{NEON_TABLE}' successfully!")
+        # Phase 2: Store all scraped unique job links ONCE into Neon DB
+        logger.info(f"🚀 Storing all {len(round1_records)} scraped unique jobs at once into Neon DB table '{NEON_TABLE}'...")
+        await save_to_neon(round1_records)
+        logger.info(f"✅ All {len(round1_records)} unique jobs stored in Neon DB table '{NEON_TABLE}' successfully!")
     else:
-        logger.warning("No jobs were extracted.")
+        logger.warning("No jobs were extracted in Round 1.")
+
+    # Trigger Round 2 automatically after Round 1 is completed
+    run_r1_only = "--round1-only" in sys.argv or os.getenv("RUN_ROUND1_ONLY", "false").lower() in ["true", "1", "yes"]
+    if not run_r1_only:
+        logger.info("\n" + "=" * 75)
+        logger.info("🎯 ROUND 1 COMPLETE! AUTOMATICALLY STARTING ROUND 2 PIPELINE...")
+        logger.info("=" * 75 + "\n")
+        try:
+            from round2_scraper import run_round2
+            await run_round2(existing_job_ids=round1_job_ids)
+        except Exception as r2_err:
+            logger.error(f"Error during Round 2 execution: {r2_err}", exc_info=True)
+
 
 if __name__ == '__main__':
+    # Allow running Round 2 directly via --round2 flag
+    if "--round2" in sys.argv:
+        from round2_scraper import run_round2
+        entry_coro = run_round2()
+    else:
+        entry_coro = main()
+
     try:
-        asyncio.run(main())
+        asyncio.run(entry_coro)
     except RuntimeError as e:
         if "running event loop" in str(e).lower() or "event loop is already running" in str(e).lower():
             try:
@@ -1157,6 +1205,7 @@ if __name__ == '__main__':
             except ImportError:
                 pass
             loop = asyncio.get_event_loop()
-            loop.run_until_complete(main())
+            loop.run_until_complete(entry_coro)
         else:
             raise
+
